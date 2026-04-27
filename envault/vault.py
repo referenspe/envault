@@ -1,105 +1,76 @@
-"""High-level Vault API: encrypt/decrypt .env files using the KeyStore."""
+"""Vault — high-level lock / unlock / sync operations with audit logging."""
 
-from __future__ import annotations
-
-import os
 from pathlib import Path
-from typing import Dict, Optional
 
 from envault.crypto import encrypt, decrypt
 from envault.env_parser import parse_env, serialize_env, merge_env
 from envault.keystore import KeyStore
+from envault import audit
 
-
-DEFAULT_VAULT_EXT = '.enc'
+ENC_SUFFIX = ".enc"
 
 
 class Vault:
-    """Encrypts and decrypts .env files, storing ciphertext alongside the
-    original file (e.g. ``.env`` → ``.env.enc``).
-    """
+    """Manages encryption and synchronisation of a single .env file."""
 
-    def __init__(self, keystore: KeyStore, vault_ext: str = DEFAULT_VAULT_EXT):
-        self._ks = keystore
-        self._ext = vault_ext
+    def __init__(self, env_path: Path, keystore: KeyStore) -> None:
+        self.env_path = Path(env_path)
+        self.enc_path = self.env_path.with_suffix(ENC_SUFFIX)
+        self.keystore = keystore
+        self._vault_dir = self.env_path.parent
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def lock(self, env_path: str | Path, profile: str = 'default') -> Path:
-        """Encrypt *env_path* and write ciphertext to ``<env_path><ext>``.
-
-        Returns the path of the encrypted file.
-        """
-        env_path = Path(env_path)
-        password = self._ks.get(profile)
-        if password is None:
-            raise KeyError(f"No key found for profile '{profile}'")
-
-        plaintext = env_path.read_bytes()
+    def lock(self, password: str) -> Path:
+        """Encrypt *env_path* → *enc_path*, record audit event, return enc path."""
+        plaintext = self.env_path.read_bytes()
         ciphertext = encrypt(plaintext, password)
+        self.enc_path.write_bytes(ciphertext)
+        self.keystore.set(str(self.env_path), password)
+        audit.record_event(
+            self._vault_dir,
+            action="lock",
+            env_file=self.env_path.name,
+        )
+        return self.enc_path
 
-        enc_path = env_path.with_suffix(env_path.suffix + self._ext)
-        enc_path.write_bytes(ciphertext)
-        return enc_path
-
-    def unlock(
-        self,
-        enc_path: str | Path,
-        dest_path: Optional[str | Path] = None,
-        profile: str = 'default',
-    ) -> Path:
-        """Decrypt *enc_path* and write plaintext to *dest_path*.
-
-        If *dest_path* is omitted the ``<ext>`` suffix is stripped.
-        Returns the path of the decrypted file.
-        """
-        enc_path = Path(enc_path)
-        if dest_path is None:
-            name = enc_path.name
-            if name.endswith(self._ext):
-                name = name[: -len(self._ext)]
-            dest_path = enc_path.with_name(name)
-        dest_path = Path(dest_path)
-
-        password = self._ks.get(profile)
-        if password is None:
-            raise KeyError(f"No key found for profile '{profile}'")
-
-        ciphertext = enc_path.read_bytes()
+    def unlock(self, password: str) -> Path:
+        """Decrypt *enc_path* → *env_path*, record audit event, return env path."""
+        ciphertext = self.enc_path.read_bytes()
         plaintext = decrypt(ciphertext, password)
-        dest_path.write_bytes(plaintext)
-        return dest_path
+        self.env_path.write_bytes(plaintext)
+        audit.record_event(
+            self._vault_dir,
+            action="unlock",
+            env_file=self.env_path.name,
+        )
+        return self.env_path
 
-    def sync(
-        self,
-        enc_path: str | Path,
-        env_path: str | Path,
-        profile: str = 'default',
-    ) -> Dict[str, str]:
-        """Decrypt *enc_path*, merge new values into *env_path*, and
-        re-encrypt the merged result.
+    def sync(self, target_path: Path, password: str) -> Path:
+        """Merge decrypted secrets into *target_path*, record audit event.
 
-        Returns the dict of changed keys.
+        Keys present in the vault take precedence over those in *target_path*.
+        Missing keys from *target_path* are preserved.
         """
-        enc_path = Path(enc_path)
-        env_path = Path(env_path)
+        target_path = Path(target_path)
 
-        password = self._ks.get(profile)
-        if password is None:
-            raise KeyError(f"No key found for profile '{profile}'")
+        ciphertext = self.enc_path.read_bytes()
+        plaintext = decrypt(ciphertext, password)
+        vault_env = parse_env(plaintext.decode())
 
-        remote_text = decrypt(enc_path.read_bytes(), password).decode()
-        remote_env = parse_env(remote_text)
+        existing_env: dict = {}
+        if target_path.exists():
+            existing_env = parse_env(target_path.read_text(encoding="utf-8"))
 
-        local_env: Dict[str, str] = {}
-        if env_path.exists():
-            local_env = parse_env(env_path.read_text())
+        merged = merge_env(existing_env, vault_env)
+        target_path.write_text(serialize_env(merged), encoding="utf-8")
 
-        merged, changed = merge_env(local_env, remote_env)
-        env_path.write_text(serialize_env(merged))
-
-        # Re-lock with the merged content
-        enc_path.write_bytes(encrypt(serialize_env(merged).encode(), password))
-        return changed
+        audit.record_event(
+            self._vault_dir,
+            action="sync",
+            env_file=self.env_path.name,
+            extra={"target": str(target_path)},
+        )
+        return target_path
