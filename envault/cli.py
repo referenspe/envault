@@ -1,74 +1,84 @@
-"""Command-line interface for envault."""
+"""CLI entry point for envault."""
 
-import sys
+from __future__ import annotations
+
+import os
 from pathlib import Path
 
 import click
 
+from envault.audit import record_event
+from envault.diff import diff_envs
+from envault.env_parser import parse_env
 from envault.keystore import KeyStore
 from envault.vault import Vault
 
-DEFAULT_ENV_FILE = ".env"
-DEFAULT_KEYSTORE = "~/.envault/keystore.json"
 
-
-def _get_vault(env_file: str, keystore_path: str) -> Vault:
-    ks = KeyStore(Path(keystore_path).expanduser())
-    return Vault(env_file=Path(env_file), keystore=ks)
+def _get_vault(env_file: str, keystore_path: str, password: str) -> Vault:
+    ks = KeyStore(path=keystore_path, password=password)
+    return Vault(env_file=env_file, keystore=ks)
 
 
 @click.group()
-@click.version_option(prog_name="envault")
-def cli():
-    """envault — encrypt and sync .env files across dev environments."""
+def cli() -> None:
+    """envault — encrypt and sync .env files."""
 
 
 @cli.command()
-@click.argument("env_file", default=DEFAULT_ENV_FILE)
-@click.option("--keystore", default=DEFAULT_KEYSTORE, show_default=True, help="Path to key store file.")
-@click.password_option("--password", prompt="Master password", help="Master password for encryption.")
-def lock(env_file: str, keystore: str, password: str):
-    """Encrypt ENV_FILE and store the key."""
-    try:
-        vault = _get_vault(env_file, keystore)
-        enc_path = vault.lock(password)
-        click.echo(f"Locked: {enc_path}")
-    except FileNotFoundError as exc:
-        click.echo(f"Error: {exc}", err=True)
-        sys.exit(1)
+@click.argument("env_file")
+@click.option("--keystore", default=".envault_keys", show_default=True)
+@click.password_option(prompt="Master password")
+def lock(env_file: str, keystore: str, password: str) -> None:
+    """Encrypt ENV_FILE and store it as <ENV_FILE>.enc."""
+    vault = _get_vault(env_file, keystore, password)
+    vault.lock()
+    record_event("lock", env_file, Path(env_file).parent)
+    click.echo(f"Locked: {env_file} -> {env_file}.enc")
 
 
 @cli.command()
-@click.argument("enc_file", default=DEFAULT_ENV_FILE + ".enc")
-@click.option("--keystore", default=DEFAULT_KEYSTORE, show_default=True, help="Path to key store file.")
-@click.option("--out", default=DEFAULT_ENV_FILE, show_default=True, help="Output .env file path.")
-@click.option("--password", prompt="Master password", hide_input=True, help="Master password for decryption.")
-def unlock(enc_file: str, keystore: str, out: str, password: str):
-    """Decrypt ENC_FILE and restore the .env file."""
-    try:
-        vault = _get_vault(out, keystore)
-        env_path = vault.unlock(password, enc_path=Path(enc_file))
-        click.echo(f"Unlocked: {env_path}")
-    except (FileNotFoundError, ValueError) as exc:
-        click.echo(f"Error: {exc}", err=True)
-        sys.exit(1)
+@click.argument("enc_file")
+@click.option("--keystore", default=".envault_keys", show_default=True)
+@click.password_option(prompt="Master password")
+def unlock(enc_file: str, keystore: str, password: str) -> None:
+    """Decrypt ENC_FILE and restore the original .env file."""
+    env_file = enc_file.removesuffix(".enc")
+    vault = _get_vault(env_file, keystore, password)
+    vault.unlock()
+    record_event("unlock", enc_file, Path(enc_file).parent)
+    click.echo(f"Unlocked: {enc_file} -> {env_file}")
 
 
 @cli.command()
-@click.argument("source_enc", default=DEFAULT_ENV_FILE + ".enc")
-@click.option("--keystore", default=DEFAULT_KEYSTORE, show_default=True, help="Path to key store file.")
-@click.option("--env-file", default=DEFAULT_ENV_FILE, show_default=True, help="Local .env file to merge into.")
-@click.option("--password", prompt="Master password", hide_input=True, help="Master password.")
-def sync(source_enc: str, keystore: str, env_file: str, password: str):
-    """Sync secrets from SOURCE_ENC into the local .env file."""
-    try:
-        vault = _get_vault(env_file, keystore)
-        result_path = vault.sync(password, enc_path=Path(source_enc))
-        click.echo(f"Synced: {result_path}")
-    except (FileNotFoundError, ValueError) as exc:
-        click.echo(f"Error: {exc}", err=True)
-        sys.exit(1)
+@click.argument("env_file")
+@click.option("--keystore", default=".envault_keys", show_default=True)
+@click.option("--mask", is_flag=True, default=False, help="Mask secret values in diff output.")
+@click.password_option(prompt="Master password")
+def sync(env_file: str, keystore: str, mask: bool, password: str) -> None:
+    """Sync ENV_FILE with its encrypted counterpart, showing a diff."""
+    enc_file = env_file + ".enc"
 
+    old_vars: dict = {}
+    if Path(enc_file).exists():
+        vault_old = _get_vault(env_file, keystore, password)
+        try:
+            old_content = vault_old.unlock(return_content=True)
+            old_vars = parse_env(old_content) if old_content else {}
+        except Exception:
+            old_vars = {}
 
-if __name__ == "__main__":
-    cli()
+    new_vars: dict = {}
+    if Path(env_file).exists():
+        new_vars = parse_env(Path(env_file).read_text())
+
+    result = diff_envs(old_vars, new_vars, mask_values=mask)
+    if result.has_changes:
+        click.echo("Changes detected:")
+        click.echo(result.summary())
+    else:
+        click.echo("No changes detected.")
+
+    vault = _get_vault(env_file, keystore, password)
+    vault.sync()
+    record_event("sync", env_file, Path(env_file).parent)
+    click.echo(f"Synced: {env_file}")
