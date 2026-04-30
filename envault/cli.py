@@ -1,84 +1,66 @@
-"""CLI entry point for envault."""
+"""Top-level CLI entry point for envault."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import click
 
-from envault.audit import record_event
-from envault.diff import diff_envs
-from envault.env_parser import parse_env
-from envault.keystore import KeyStore
 from envault.vault import Vault
+from envault.keystore import KeyStore
+from envault.cli_export import export_cmd
+from envault.cli_tags import tags_cmd
+
+_DEFAULT_ENV = ".env"
+_DEFAULT_ENC = ".env.enc"
+_DEFAULT_KS = "~/.envault/keystore.json"
 
 
-def _get_vault(env_file: str, keystore_path: str, password: str) -> Vault:
-    ks = KeyStore(path=keystore_path, password=password)
-    return Vault(env_file=env_file, keystore=ks)
+def _get_vault(env_path: str, enc_path: str, ks_path: str) -> Vault:
+    ks = KeyStore(Path(ks_path).expanduser())
+    return Vault(env_file=Path(env_path), enc_file=Path(enc_path), keystore=ks)
 
 
 @click.group()
 def cli() -> None:
-    """envault — encrypt and sync .env files."""
+    """envault — encrypted .env manager."""
 
 
 @cli.command()
-@click.argument("env_file")
-@click.option("--keystore", default=".envault_keys", show_default=True)
-@click.password_option(prompt="Master password")
-def lock(env_file: str, keystore: str, password: str) -> None:
-    """Encrypt ENV_FILE and store it as <ENV_FILE>.enc."""
-    vault = _get_vault(env_file, keystore, password)
-    vault.lock()
-    record_event("lock", env_file, Path(env_file).parent)
-    click.echo(f"Locked: {env_file} -> {env_file}.enc")
+@click.argument("password")
+@click.option("--env", "env_path", default=_DEFAULT_ENV, show_default=True)
+@click.option("--enc", "enc_path", default=_DEFAULT_ENC, show_default=True)
+@click.option("--keystore", "ks_path", default=_DEFAULT_KS, show_default=True)
+def lock(password: str, env_path: str, enc_path: str, ks_path: str) -> None:
+    """Encrypt the .env file."""
+    vault = _get_vault(env_path, enc_path, ks_path)
+    vault.lock(password)
+    click.echo(f"Locked: {enc_path}")
 
 
 @cli.command()
-@click.argument("enc_file")
-@click.option("--keystore", default=".envault_keys", show_default=True)
-@click.password_option(prompt="Master password")
-def unlock(enc_file: str, keystore: str, password: str) -> None:
-    """Decrypt ENC_FILE and restore the original .env file."""
-    env_file = enc_file.removesuffix(".enc")
-    vault = _get_vault(env_file, keystore, password)
-    vault.unlock()
-    record_event("unlock", enc_file, Path(enc_file).parent)
-    click.echo(f"Unlocked: {enc_file} -> {env_file}")
+@click.argument("password")
+@click.option("--env", "env_path", default=_DEFAULT_ENV, show_default=True)
+@click.option("--enc", "enc_path", default=_DEFAULT_ENC, show_default=True)
+@click.option("--keystore", "ks_path", default=_DEFAULT_KS, show_default=True)
+def unlock(password: str, env_path: str, enc_path: str, ks_path: str) -> None:
+    """Decrypt the .env.enc file."""
+    vault = _get_vault(env_path, enc_path, ks_path)
+    vault.unlock(password)
+    click.echo(f"Unlocked: {env_path}")
 
 
 @cli.command()
-@click.argument("env_file")
-@click.option("--keystore", default=".envault_keys", show_default=True)
-@click.option("--mask", is_flag=True, default=False, help="Mask secret values in diff output.")
-@click.password_option(prompt="Master password")
-def sync(env_file: str, keystore: str, mask: bool, password: str) -> None:
-    """Sync ENV_FILE with its encrypted counterpart, showing a diff."""
-    enc_file = env_file + ".enc"
+@click.argument("password")
+@click.option("--env", "env_path", default=_DEFAULT_ENV, show_default=True)
+@click.option("--enc", "enc_path", default=_DEFAULT_ENC, show_default=True)
+@click.option("--keystore", "ks_path", default=_DEFAULT_KS, show_default=True)
+def sync(password: str, env_path: str, enc_path: str, ks_path: str) -> None:
+    """Sync (merge) local .env with encrypted store."""
+    vault = _get_vault(env_path, enc_path, ks_path)
+    vault.sync(password)
+    click.echo("Synced.")
 
-    old_vars: dict = {}
-    if Path(enc_file).exists():
-        vault_old = _get_vault(env_file, keystore, password)
-        try:
-            old_content = vault_old.unlock(return_content=True)
-            old_vars = parse_env(old_content) if old_content else {}
-        except Exception:
-            old_vars = {}
 
-    new_vars: dict = {}
-    if Path(env_file).exists():
-        new_vars = parse_env(Path(env_file).read_text())
-
-    result = diff_envs(old_vars, new_vars, mask_values=mask)
-    if result.has_changes:
-        click.echo("Changes detected:")
-        click.echo(result.summary())
-    else:
-        click.echo("No changes detected.")
-
-    vault = _get_vault(env_file, keystore, password)
-    vault.sync()
-    record_event("sync", env_file, Path(env_file).parent)
-    click.echo(f"Synced: {env_file}")
+cli.add_command(export_cmd, name="export")
+cli.add_command(tags_cmd, name="tags")
